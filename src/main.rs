@@ -29,13 +29,18 @@ struct Args {
     /// Where SBE output is written; logs always go to stderr.
     #[arg(long, default_value = "/dev/stdout")]
     output: PathBuf,
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 1000)]
     markets_per_conn: usize,
+    /// Kalshi allows 200 concurrent websockets per user; leave headroom.
+    #[arg(long, default_value_t = 190)]
+    max_conns: usize,
     /// Only collect the first N markets (for testing).
     #[arg(long)]
     max_markets: Option<usize>,
-    #[arg(long, default_value_t = 30)]
-    discovery_secs: u64,
+    #[arg(long, default_value_t = 300)]
+    full_discovery_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    new_discovery_secs: u64,
     #[arg(long, default_value_t = 60)]
     snapshot_secs: u64,
 }
@@ -56,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     let writer = AlignedSbeWriter::create(&args.output, CHUNK_SIZE_64_MEBIBYTES)?;
     let cfg = Config {
         markets_per_conn: args.markets_per_conn,
+        max_conns: args.max_conns,
         ..Config::default()
     };
     let mut collector = Collector::new(cfg, writer);
@@ -64,7 +70,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(discover(
         exchange.clone(),
         symbols_tx,
-        Duration::from_secs(args.discovery_secs),
+        Duration::from_secs(args.full_discovery_secs),
+        Duration::from_secs(args.new_discovery_secs),
         args.max_markets,
     ));
 
@@ -83,7 +90,13 @@ async fn main() -> anyhow::Result<()> {
             biased;
             _ = &mut sigint => break,
             Some(msg) = inbound_rx.recv() => collector.on_inbound(msg, Instant::now())?,
-            Some(live) = symbols_rx.recv() => collector.set_symbols(&live, Instant::now()),
+            Some(found) = symbols_rx.recv() => match found {
+                Discovered::All(live) => {
+                    tracing::info!(markets = live.len(), "full discovery");
+                    collector.set_symbols(&live, Instant::now())
+                }
+                Discovered::New(new) => collector.add_symbols(&new, Instant::now()),
+            },
             _ = snapshots.tick() => {
                 let n = collector.write_snapshots(Utc::now())?;
                 tracing::info!(snapshots = n, conns = conns.len(), "periodic snapshot");
@@ -127,30 +140,53 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+enum Discovered {
+    All(BTreeSet<String>),
+    New(BTreeSet<String>),
+}
+
+/// Markets on Kalshi open within ~16 min of creation, so an hour of lookback is ample.
+const NEW_MARKET_LOOKBACK: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
+/// A cheap frequent poll for new listings, plus a slow full listing that also catches closures.
 async fn discover<E: Exchange>(
     exchange: Arc<E>,
-    out: mpsc::Sender<BTreeSet<String>>,
-    every: Duration,
+    out: mpsc::Sender<Discovered>,
+    full_every: Duration,
+    new_every: Duration,
     max: Option<usize>,
 ) {
-    let mut interval = tokio::time::interval(every);
+    let mut full = tokio::time::interval(full_every);
+    let mut new = tokio::time::interval(new_every);
     loop {
-        interval.tick().await;
-        match exchange.list_symbols().await {
+        let is_full = tokio::select! {
+            biased;
+            _ = full.tick() => true,
+            _ = new.tick() => false,
+        };
+        if max.is_some() && !is_full {
+            continue;
+        }
+        let since = (!is_full).then(|| Utc::now() - NEW_MARKET_LOOKBACK);
+        let found = match exchange.list_symbols(since).await {
+            Ok(symbols) => symbols,
+            Err(e) => {
+                tracing::warn!(is_full, "discovery failed: {e:#}");
+                continue;
+            }
+        };
+        let msg = match is_full {
             // An empty list is far likelier an API glitch than every market closing at once.
-            Ok(symbols) if symbols.is_empty() => {
-                tracing::warn!("discovery returned no markets; ignoring")
+            true if found.is_empty() => {
+                tracing::warn!("full discovery returned no markets; ignoring");
+                continue;
             }
-            Ok(symbols) => {
-                let symbols = symbols
-                    .into_iter()
-                    .take(max.unwrap_or(usize::MAX))
-                    .collect();
-                if out.send(symbols).await.is_err() {
-                    return;
-                }
-            }
-            Err(e) => tracing::warn!("discovery failed: {e:#}"),
+            true => Discovered::All(found.into_iter().take(max.unwrap_or(usize::MAX)).collect()),
+            false if found.is_empty() => continue,
+            false => Discovered::New(found),
+        };
+        if out.send(msg).await.is_err() {
+            return;
         }
     }
 }

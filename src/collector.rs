@@ -19,6 +19,8 @@ pub const REPLICAS: usize = 2;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub markets_per_conn: usize,
+    /// Exchange-side connection limit; past it, new markets go to the least-loaded group.
+    pub max_conns: usize,
     /// How long the source may trail another replica's clock before we fail over.
     pub lag_switch: Duration,
     /// How long a backup may trail before we treat its subscription as dead and resubscribe.
@@ -35,7 +37,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            markets_per_conn: 250,
+            markets_per_conn: 1000,
+            max_conns: 190,
             lag_switch: Duration::from_millis(500),
             lag_resub: Duration::from_secs(5),
             idle_verify: Duration::from_secs(30 * 60),
@@ -184,7 +187,7 @@ impl<S: Sink> Collector<S> {
         self.conns.len()
     }
 
-    /// Reconciles the subscribed set with the exchange's live symbols.
+    /// Reconciles the subscribed set with the exchange's full list of live symbols.
     pub fn set_symbols(&mut self, live: &BTreeSet<String>, now: Instant) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -206,7 +209,13 @@ impl<S: Sink> Collector<S> {
             conn,
             cmd: Command::Unsubscribe(s),
         }));
+        actions.extend(self.add_symbols(live, now));
+        actions
+    }
 
+    /// Subscribes any symbols we aren't collecting yet.
+    pub fn add_symbols(&mut self, live: &BTreeSet<String>, now: Instant) -> Vec<Action> {
+        let mut actions = Vec::new();
         let first_new_group = self.groups.len();
         let mut added: HashMap<usize, Vec<String>> = HashMap::new();
         let new: Vec<&String> = live
@@ -257,6 +266,11 @@ impl<S: Sink> Collector<S> {
             .position(|g| g.size < self.cfg.markets_per_conn)
         {
             return g;
+        }
+        if self.conns.len() + REPLICAS > self.cfg.max_conns {
+            return (0..self.groups.len())
+                .min_by_key(|&g| self.groups[g].size)
+                .expect("max_conns allows at least one group");
         }
         let group = self.groups.len();
         let conns = (0..REPLICAS)
@@ -729,6 +743,22 @@ mod tests {
             actions,
             [sub(0, "D"), unsub(0, "B"), sub(1, "D"), unsub(1, "B")]
         );
+    }
+
+    #[test]
+    fn connection_cap_spreads_overflow_across_groups() {
+        let cfg = Config {
+            markets_per_conn: 1,
+            max_conns: 4,
+            ..Config::default()
+        };
+        let mut c = Collector::new(cfg, Vec::<Rec>::new());
+        let live: BTreeSet<String> = ["A", "B", "C", "D", "E"].map(String::from).into();
+        c.set_symbols(&live, Instant::now());
+        assert_eq!(c.conn_count(), 4);
+        let mut sizes: Vec<_> = c.groups.iter().map(|g| g.size).collect();
+        sizes.sort();
+        assert_eq!(sizes, [2, 3]);
     }
 
     #[test]

@@ -83,7 +83,11 @@ impl Kalshi {
         ]
     }
 
-    async fn markets_page(&self, cursor: &str) -> anyhow::Result<MarketsPage> {
+    async fn markets_page(
+        &self,
+        cursor: &str,
+        created_since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<MarketsPage> {
         let path = format!("{REST_PATH}/markets");
         let mut backoff = Duration::from_millis(500);
         loop {
@@ -97,6 +101,9 @@ impl Kalshi {
                 ]);
             if !cursor.is_empty() {
                 req = req.query(&[("cursor", cursor)]);
+            }
+            if let Some(t) = created_since {
+                req = req.query(&[("min_created_ts", t.timestamp())]);
             }
             for (k, v) in self.auth_headers("GET", &path) {
                 req = req.header(k, v);
@@ -131,11 +138,14 @@ struct Market {
 impl Exchange for Kalshi {
     type Session = KalshiSession;
 
-    async fn list_symbols(&self) -> anyhow::Result<BTreeSet<String>> {
+    async fn list_symbols(
+        &self,
+        created_since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<BTreeSet<String>> {
         let mut symbols = BTreeSet::new();
         let mut cursor = String::new();
         loop {
-            let page = self.markets_page(&cursor).await?;
+            let page = self.markets_page(&cursor, created_since).await?;
             // mve_filter=exclude should already drop these; filter again in case it ever doesn't.
             symbols.extend(
                 page.markets

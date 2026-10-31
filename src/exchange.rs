@@ -41,8 +41,11 @@ pub enum Event {
 pub trait Exchange: Send + Sync + 'static {
     type Session: Session;
 
-    /// All currently tradeable symbols we should be collecting.
-    fn list_symbols(&self) -> impl Future<Output = anyhow::Result<BTreeSet<String>>> + Send;
+    /// Currently tradeable symbols; `created_since` narrows it to recent listings for cheap polling.
+    fn list_symbols(
+        &self,
+        created_since: Option<DateTime<Utc>>,
+    ) -> impl Future<Output = anyhow::Result<BTreeSet<String>>> + Send;
 
     /// A websocket handshake request, including any auth.
     fn ws_request(&self) -> anyhow::Result<Request>;
