@@ -93,11 +93,15 @@ sockets is just quiet, but a market that moves on one socket and not the other i
 - A backup whose clock trails for 5 s is unsubscribed and resubscribed.
 - A resubscribe whose snapshot hasn't arrived after 30 s is retried.
 - A market with no updates for 30 min is re-verified: its backup is resubscribed and the fresh
-  snapshot is compared with the source's book (see above).
+  snapshot is compared with the source's book (see above). This runs as a background sweep with its
+  own small per-tick budget. At 230k markets they all come due together, and they must never crowd
+  out the urgent lag and stuck checks.
 - Each socket is fully reconnected once an hour. Reconnects are spread evenly across all sockets,
   and a socket only goes down when its partner is connected **and** synced on every shared market,
   so a market is never left without a valid copy.
 - Resubscribes are capped per tick so a burst of lag can't snowball.
+- A market is only unsubscribed after it's missing from two full listings in a row. A slow paged
+  listing can skip a market that's still live.
 
 ### 3. Exchange-agnostic core
 
@@ -131,7 +135,7 @@ after creation, so a 1-hour lookback is ample.
 
 ## Verification
 
-`cargo test`: 23 tests covering parsing, book math, the Kalshi decoder (from the docs' example
+`cargo test`: 28 tests covering parsing, book math, the Kalshi decoder (from the docs' example
 frames and the real `ok` frame above), and the collector's failover, lag, divergence, reconnect
 staggering and sharding logic.
 

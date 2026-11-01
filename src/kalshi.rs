@@ -307,7 +307,9 @@ impl Session for KalshiSession {
             }
             Frame::Subscribed { msg } => {
                 if msg.channel == "orderbook_delta" {
+                    // A new sid numbers its messages from scratch.
                     self.sid = Some(msg.sid);
+                    self.last_seq = None;
                 }
             }
             Frame::Ok { seq: Some(seq) } => self.check_seq(seq, &mut events),
@@ -468,6 +470,16 @@ mod tests {
         let ack = r#"{"type":"ok","id":2,"sid":1,"seq":2,"msg":{"market_tickers":["A"]}}"#;
         assert!(s.decode(ack).unwrap().is_empty());
         assert_eq!(s.decode(&delta(3, "yes")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn new_sid_restarts_seq() {
+        let mut s = KalshiSession::default();
+        s.decode(SNAPSHOT).unwrap();
+        s.decode(&delta(2, "yes")).unwrap();
+        s.decode(r#"{"type":"subscribed","msg":{"channel":"orderbook_delta","sid":9}}"#)
+            .unwrap();
+        assert!(!s.decode(&delta(1, "yes")).unwrap().contains(&Event::Gap));
     }
 
     #[test]

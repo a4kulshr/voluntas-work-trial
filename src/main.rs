@@ -143,6 +143,12 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("some websockets did not close within 5s");
     }
+    // Write data that arrived before the close; skip the Down notices the close itself produced.
+    while let Ok(msg) = inbound_rx.try_recv() {
+        if matches!(msg.msg, connection::ConnMsg::Event(_)) {
+            collector.on_inbound(msg, Instant::now())?;
+        }
+    }
     collector.sink_mut().flush()?;
     tracing::info!("output flushed and closed");
     Ok(())

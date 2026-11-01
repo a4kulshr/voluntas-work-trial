@@ -29,8 +29,11 @@ pub struct Config {
     /// Retry a resubscribe whose snapshot never arrived.
     pub resync_timeout: Duration,
     pub reconnect_every: Duration,
-    /// Spreads resubscribes out so a quiet period doesn't trigger a storm.
+    /// Caps resubscribes for lagging or stuck replicas per tick so a burst can't snowball.
     pub max_resubs_per_tick: usize,
+    /// Idle verification is a background sweep with its own small budget, so it never crowds out
+    /// lagging or stuck replicas (at 230k markets, all of them come due together).
+    pub max_idle_verifies_per_tick: usize,
 }
 
 impl Default for Config {
@@ -43,6 +46,7 @@ impl Default for Config {
             resync_timeout: Duration::from_secs(30),
             reconnect_every: Duration::from_secs(60 * 60),
             max_resubs_per_tick: 100,
+            max_idle_verifies_per_tick: 10,
         }
     }
 }
@@ -143,6 +147,8 @@ pub struct Collector<S> {
     cfg: Config,
     sink: S,
     markets: HashMap<String, Market>,
+    /// Markets absent from the last full listing; dropped only if absent again.
+    missing: HashSet<String>,
     groups: Vec<Group>,
     conns: Vec<Conn>,
 }
@@ -154,9 +160,6 @@ struct Resubs(HashMap<ConnId, Vec<String>>);
 impl Resubs {
     fn add(&mut self, conn: ConnId, symbol: &str) {
         self.0.entry(conn).or_default().push(symbol.to_owned());
-    }
-    fn len(&self) -> usize {
-        self.0.values().map(Vec::len).sum()
     }
     fn into_actions(self) -> impl Iterator<Item = Action> {
         self.0.into_iter().map(|(conn, s)| Action::Send {
@@ -172,6 +175,7 @@ impl<S: Sink> Collector<S> {
             cfg,
             sink,
             markets: HashMap::new(),
+            missing: HashSet::new(),
             groups: Vec::new(),
             conns: Vec::new(),
         }
@@ -185,16 +189,19 @@ impl<S: Sink> Collector<S> {
         self.conns.len()
     }
 
-    /// Reconciles the subscribed set with the exchange's full list of live symbols.
+    /// Reconciles the subscribed set with the exchange's full list of live symbols. A market is
+    /// only dropped after missing from two listings in a row, since a slow paged listing can skip one.
     pub fn set_symbols(&mut self, live: &BTreeSet<String>, now: Instant) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        let removed: Vec<String> = self
+        let absent: HashSet<String> = self
             .markets
             .keys()
             .filter(|s| !live.contains(*s))
             .cloned()
             .collect();
+        let removed: Vec<String> = absent.intersection(&self.missing).cloned().collect();
+        self.missing = absent;
         let mut unsubs: HashMap<ConnId, Vec<String>> = HashMap::new();
         for symbol in removed {
             let market = self.markets.remove(&symbol).expect("key from map");
@@ -398,6 +405,9 @@ impl<S: Sink> Collector<S> {
                 tracing::warn!(conn, symbol, "bad snapshot: {e:#}");
                 market.replicas[idx].invalidate(now);
                 resubs.add(conn, symbol);
+                if market.source == Some(idx) {
+                    failover(&mut self.sink, symbol, market, at)?;
+                }
                 return Ok(());
             }
         };
@@ -493,10 +503,8 @@ impl<S: Sink> Collector<S> {
     pub fn on_tick(&mut self, at: DateTime<Utc>, now: Instant) -> anyhow::Result<Vec<Action>> {
         let cfg = &self.cfg;
         let mut resubs = Resubs::default();
+        let (mut urgent, mut idle) = (0, 0);
         for (symbol, market) in &mut self.markets {
-            if resubs.len() >= cfg.max_resubs_per_tick {
-                break;
-            }
             let lagging = |i: usize, r: &Replica| {
                 let limit = if Some(i) == market.source {
                     cfg.lag_switch
@@ -505,13 +513,20 @@ impl<S: Sink> Collector<S> {
                 };
                 r.behind_since.is_some_and(|t| now - t >= limit)
             };
-            let unhealthy = market.replicas.iter().enumerate().position(|(i, r)| {
-                let stuck = !r.synced
-                    && self.conns[r.conn].up
-                    && now - r.unsynced_since >= cfg.resync_timeout;
-                stuck || lagging(i, r)
-            });
-            let idle_backup = (now - market.last_activity >= cfg.idle_verify)
+            let unhealthy = (urgent < cfg.max_resubs_per_tick)
+                .then(|| {
+                    market.replicas.iter().enumerate().position(|(i, r)| {
+                        let stuck = !r.synced
+                            && self.conns[r.conn].up
+                            && now - r.unsynced_since >= cfg.resync_timeout;
+                        stuck || lagging(i, r)
+                    })
+                })
+                .flatten();
+            let idle_due = unhealthy.is_none()
+                && idle < cfg.max_idle_verifies_per_tick
+                && now - market.last_activity >= cfg.idle_verify;
+            let idle_backup = idle_due
                 .then(|| {
                     market
                         .replicas
@@ -524,8 +539,11 @@ impl<S: Sink> Collector<S> {
             let Some(i) = unhealthy.or(idle_backup) else {
                 continue;
             };
-            if idle_backup == Some(i) {
+            if unhealthy.is_some() {
+                urgent += 1;
+            } else {
                 // Its fresh snapshot gets compared against the source in on_snapshot.
+                idle += 1;
                 market.last_activity = now;
             }
             tracing::info!(
@@ -560,7 +578,9 @@ impl<S: Sink> Collector<S> {
                 .all(|&c| self.conns[c].up)
             {
                 self.conns[id].next_reconnect = now + self.cfg.reconnect_every;
-                // One socket per group at a time, even when several are overdue.
+                // Down from now on: the socket may take a while to act on the command, and its
+                // partner must not be scheduled meanwhile. `Up` comes back after the reconnect.
+                self.conns[id].up = false;
                 degraded.insert(self.conns[id].group);
                 actions.push(Action::Send {
                     conn: id,
@@ -748,11 +768,11 @@ mod tests {
             conn,
             cmd: Command::Unsubscribe(vec![s.into()]),
         };
-        // Removing "B" empties group 1, so "D" goes there.
-        assert_eq!(
-            actions,
-            [sub(2, "D"), unsub(2, "B"), sub(3, "D"), unsub(3, "B")]
-        );
+        // "D" goes to the lighter group 1; "B" is only dropped after a second missing listing.
+        assert_eq!(actions, [sub(2, "D"), sub(3, "D")]);
+        let mut actions = c.set_symbols(&live, now);
+        actions.sort_by_key(|a| format!("{a:?}"));
+        assert_eq!(actions, [unsub(2, "B"), unsub(3, "B")]);
     }
 
     #[test]
@@ -928,6 +948,98 @@ mod tests {
         c.on_inbound(bid(1, 2, 400_000, 1), t).unwrap();
         c.on_inbound(bid(0, 2, 400_000, 1), t).unwrap();
         assert_eq!(c.on_tick(ts(), t).unwrap(), [reconnect(1)]);
+    }
+
+    #[test]
+    fn idle_sweep_never_crowds_out_a_lagging_source() {
+        let now = Instant::now();
+        let cfg = Config {
+            max_conns: REPLICAS,
+            max_resubs_per_tick: 1,
+            max_idle_verifies_per_tick: 1,
+            ..Config::default()
+        };
+        let mut c = Collector::new(cfg, Vec::<Rec>::new());
+        let live: BTreeSet<String> = ["A", "B", "C", "D"].map(String::from).into();
+        c.set_symbols(&live, now);
+        for conn in 0..2 {
+            c.on_inbound(inbound(conn, ConnMsg::Up), now).unwrap();
+            for s in &live {
+                let event = Event::Snapshot {
+                    symbol: s.clone(),
+                    clock: 1,
+                    exchange_ts: None,
+                    bids: vec![],
+                    asks: vec![],
+                };
+                c.on_inbound(inbound(conn, ConnMsg::Event(event)), now)
+                    .unwrap();
+            }
+        }
+        // Every market is idle-due, and A's source also lags.
+        let t = now + Config::default().idle_verify;
+        c.on_inbound(bid(1, 2, 400_000, 1), t).unwrap();
+        let actions = c.on_tick(ts(), t + Duration::from_secs(1)).unwrap();
+        let resubs: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    conn,
+                    cmd: Command::Resubscribe(s),
+                } => Some((*conn, s.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(resubs.contains(&(0, vec!["A".into()])), "{resubs:?}");
+        assert_eq!(
+            resubs.iter().map(|(_, s)| s.len()).sum::<usize>(),
+            2,
+            "{resubs:?}"
+        );
+    }
+
+    #[test]
+    fn a_socket_told_to_reconnect_counts_as_down() {
+        let now = Instant::now();
+        let mut c = synced(now);
+        let late = now + 3 * Config::default().reconnect_every;
+        let reconnect = |conn| Action::Send {
+            conn,
+            cmd: Command::Reconnect,
+        };
+        c.on_inbound(bid(0, 2, 400_000, 1), late).unwrap();
+        c.on_inbound(bid(1, 2, 400_000, 1), late).unwrap();
+        assert_eq!(c.on_tick(ts(), late).unwrap(), [reconnect(0)]);
+        // Conn 0 hasn't reported Down yet; conn 1 must still wait.
+        let next = late + Duration::from_secs(1);
+        assert!(!c.on_tick(ts(), next).unwrap().contains(&reconnect(1)));
+    }
+
+    #[test]
+    fn markets_drop_only_after_two_missing_listings() {
+        let now = Instant::now();
+        let mut c = synced(now);
+        let unsub_a = |conn| Action::Send {
+            conn,
+            cmd: Command::Unsubscribe(vec!["A".into()]),
+        };
+        let none = BTreeSet::from(["Z".to_owned()]);
+        assert!(!c.set_symbols(&none, now).contains(&unsub_a(0)));
+        let back = BTreeSet::from(["A".to_owned()]);
+        c.set_symbols(&back, now);
+        assert!(
+            !c.set_symbols(&none, now).contains(&unsub_a(0)),
+            "a reappearance resets the count"
+        );
+        assert!(c.set_symbols(&none, now).contains(&unsub_a(0)));
+    }
+
+    #[test]
+    fn bad_snapshot_on_source_fails_over() {
+        let now = Instant::now();
+        let mut c = synced(now);
+        c.on_inbound(snap(0, 2, vec![(400_000, -1)]), now).unwrap();
+        assert_eq!(bids(&c.sink[0]), [(400_000, 10)]);
     }
 
     #[test]
