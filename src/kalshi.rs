@@ -44,7 +44,7 @@ impl Env {
 
 /// Kalshi accepts Ed25519 (its recommendation) or RSA-PSS/SHA-256 keys.
 enum Key {
-    Ed25519(ed25519_dalek::SigningKey),
+    Ed25519(Box<ed25519_dalek::SigningKey>),
     Rsa(Box<BlindedSigningKey<Sha256>>),
 }
 
@@ -55,7 +55,7 @@ impl Key {
                 pem,
             )
         {
-            return Ok(Self::Ed25519(k));
+            return Ok(Self::Ed25519(Box::new(k)));
         }
         let rsa = rsa::RsaPrivateKey::from_pkcs1_pem(pem)
             .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))

@@ -29,8 +29,6 @@ struct Args {
     /// Where SBE output is written; logs always go to stderr.
     #[arg(long, default_value = "/dev/stdout")]
     output: PathBuf,
-    #[arg(long, default_value_t = 1000)]
-    markets_per_conn: usize,
     /// Kalshi allows 200 concurrent websockets per user; leave headroom.
     #[arg(long, default_value_t = 190)]
     max_conns: usize,
@@ -60,7 +58,6 @@ async fn main() -> anyhow::Result<()> {
     let exchange = Arc::new(Kalshi::new(args.env, args.key_id, &pem)?);
     let writer = AlignedSbeWriter::create(&args.output, CHUNK_SIZE_64_MEBIBYTES)?;
     let cfg = Config {
-        markets_per_conn: args.markets_per_conn,
         max_conns: args.max_conns,
         ..Config::default()
     };

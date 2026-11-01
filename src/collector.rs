@@ -18,7 +18,6 @@ pub const REPLICAS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub markets_per_conn: usize,
     /// Exchange-side connection limit; past it, new markets go to the least-loaded group.
     pub max_conns: usize,
     /// How long the source may trail another replica's clock before we fail over.
@@ -37,7 +36,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            markets_per_conn: 1000,
             max_conns: 190,
             lag_switch: Duration::from_millis(500),
             lag_resub: Duration::from_secs(5),
@@ -223,7 +221,7 @@ impl<S: Sink> Collector<S> {
             .filter(|s| !self.markets.contains_key(*s))
             .collect();
         for symbol in new {
-            let group = self.group_with_room(now);
+            let group = self.pick_group(now);
             self.groups[group].size += 1;
             let replicas = self.groups[group]
                 .conns
@@ -259,24 +257,21 @@ impl<S: Sink> Collector<S> {
         actions
     }
 
-    fn group_with_room(&mut self, now: Instant) -> usize {
-        if let Some(g) = self
-            .groups
-            .iter()
-            .position(|g| g.size < self.cfg.markets_per_conn)
-        {
-            return g;
-        }
-        if self.conns.len() + REPLICAS > self.cfg.max_conns {
+    /// Opens the full pool of groups, then fills the least loaded one. Discovery returns markets
+    /// clustered by series, so filling in order would pile a hot series onto a single socket pair.
+    fn pick_group(&mut self, now: Instant) -> usize {
+        let max_groups = (self.cfg.max_conns / REPLICAS).max(1);
+        if self.groups.len() >= max_groups {
             return (0..self.groups.len())
                 .min_by_key(|&g| self.groups[g].size)
-                .expect("max_conns allows at least one group");
+                .expect("at least one group");
         }
         let group = self.groups.len();
         let conns = (0..REPLICAS)
             .map(|k| {
-                // Stagger scheduled reconnects so a group's replicas are never down together.
-                let offset = self.cfg.reconnect_every * (k as u32 + 1) / REPLICAS as u32;
+                // Spread scheduled reconnects evenly over the period across every socket.
+                let slot = (group * REPLICAS + k + 1) as u32;
+                let offset = self.cfg.reconnect_every * slot / (max_groups * REPLICAS) as u32;
                 self.conns.push(Conn {
                     group,
                     up: false,
@@ -548,7 +543,7 @@ impl<S: Sink> Collector<S> {
 
         let mut actions: Vec<Action> = resubs.into_actions().collect();
         // Only take a socket down when every market in its group is fully covered by the others.
-        let degraded: HashSet<usize> = self
+        let mut degraded: HashSet<usize> = self
             .markets
             .values()
             .filter(|m| m.replicas.iter().any(|r| !r.synced))
@@ -565,6 +560,8 @@ impl<S: Sink> Collector<S> {
                 .all(|&c| self.conns[c].up)
             {
                 self.conns[id].next_reconnect = now + self.cfg.reconnect_every;
+                // One socket per group at a time, even when several are overdue.
+                degraded.insert(self.conns[id].group);
                 actions.push(Action::Send {
                     conn: id,
                     cmd: Command::Reconnect,
@@ -704,7 +701,11 @@ mod tests {
 
     /// One market "A" on conns 0 and 1, both up and synced at clock 1; conn 0 is the source.
     fn synced(now: Instant) -> Collector<Vec<Rec>> {
-        let mut c = Collector::new(Config::default(), Vec::new());
+        let cfg = Config {
+            max_conns: REPLICAS,
+            ..Config::default()
+        };
+        let mut c = Collector::new(cfg, Vec::new());
         c.set_symbols(&BTreeSet::from(["A".to_owned()]), now);
         for conn in 0..2 {
             c.on_inbound(inbound(conn, ConnMsg::Up), now).unwrap();
@@ -719,7 +720,7 @@ mod tests {
     #[test]
     fn shards_symbols_across_replicated_groups() {
         let cfg = Config {
-            markets_per_conn: 2,
+            max_conns: 4,
             ..Config::default()
         };
         let mut c = Collector::new(cfg, Vec::<Rec>::new());
@@ -747,17 +748,16 @@ mod tests {
             conn,
             cmd: Command::Unsubscribe(vec![s.into()]),
         };
-        // "B" frees a slot in group 0, which "D" reuses.
+        // Removing "B" empties group 1, so "D" goes there.
         assert_eq!(
             actions,
-            [sub(0, "D"), unsub(0, "B"), sub(1, "D"), unsub(1, "B")]
+            [sub(2, "D"), unsub(2, "B"), sub(3, "D"), unsub(3, "B")]
         );
     }
 
     #[test]
-    fn connection_cap_spreads_overflow_across_groups() {
+    fn markets_round_robin_across_the_full_pool() {
         let cfg = Config {
-            markets_per_conn: 1,
             max_conns: 4,
             ..Config::default()
         };
@@ -765,9 +765,25 @@ mod tests {
         let live: BTreeSet<String> = ["A", "B", "C", "D", "E"].map(String::from).into();
         c.set_symbols(&live, Instant::now());
         assert_eq!(c.conn_count(), 4);
-        let mut sizes: Vec<_> = c.groups.iter().map(|g| g.size).collect();
-        sizes.sort();
-        assert_eq!(sizes, [2, 3]);
+        let sizes: Vec<_> = c.groups.iter().map(|g| g.size).collect();
+        assert_eq!(sizes, [3, 2]);
+    }
+
+    #[test]
+    fn overdue_partners_never_reconnect_in_the_same_tick() {
+        let now = Instant::now();
+        let mut c = synced(now);
+        let late = now + 3 * Config::default().reconnect_every;
+        c.on_inbound(bid(0, 2, 400_000, 1), late).unwrap();
+        c.on_inbound(bid(1, 2, 400_000, 1), late).unwrap();
+        let actions = c.on_tick(ts(), late).unwrap();
+        assert_eq!(
+            actions,
+            [Action::Send {
+                conn: 0,
+                cmd: Command::Reconnect
+            }]
+        );
     }
 
     #[test]
