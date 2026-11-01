@@ -20,6 +20,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Spaces out initial handshakes; opening every socket at once gets HTTP 429.
+const STARTUP_SPACING: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -63,6 +65,7 @@ pub async fn run<E: Exchange>(
             msg,
         })
     };
+    tokio::time::sleep(STARTUP_SPACING * id as u32).await;
     let mut backoff = MIN_BACKOFF;
     loop {
         match stream(&*exchange, id, &mut symbols, &mut cmds, &out, &mut backoff).await {
@@ -119,6 +122,7 @@ async fn stream<E: Exchange>(
 
     let initial: Vec<String> = symbols.iter().cloned().collect();
     for frame in session.subscribe(&initial) {
+        tracing::trace!(conn = id, sent = frame.as_str());
         tx.send(Message::text(frame)).await?;
     }
     out.send(Inbound {
@@ -165,6 +169,7 @@ async fn stream<E: Exchange>(
                     }
                 };
                 for frame in frames {
+                    tracing::trace!(conn = id, sent = frame.as_str());
                     tx.send(Message::text(frame)).await?;
                 }
             }

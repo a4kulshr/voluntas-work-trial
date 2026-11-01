@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,7 +7,7 @@ use anyhow::Context;
 use chrono::Utc;
 use clap::Parser;
 use engineering_challenge::collector::{Action, Collector, Config};
-use engineering_challenge::connection::{self, Command};
+use engineering_challenge::connection::{self, Command, ConnId};
 use engineering_challenge::exchange::Exchange;
 use engineering_challenge::kalshi::{Env, Kalshi};
 use engineering_challenge::util::AlignedSbeWriter;
@@ -72,13 +72,15 @@ async fn main() -> anyhow::Result<()> {
         args.max_markets,
     ));
 
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
-    let mut conns: Vec<mpsc::UnboundedSender<Command>> = Vec::new();
+    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<connection::Inbound>();
+    // Keyed by id: the collector may spawn several groups at once, in any order.
+    let mut conns: HashMap<ConnId, mpsc::UnboundedSender<Command>> = HashMap::new();
     let mut tasks = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let snapshot_every = Duration::from_secs(args.snapshot_secs);
     let mut snapshots =
         tokio::time::interval_at(tokio::time::Instant::now() + snapshot_every, snapshot_every);
+    let mut max_queue_delay = chrono::TimeDelta::zero();
     let sigint = tokio::signal::ctrl_c();
     tokio::pin!(sigint);
 
@@ -86,7 +88,10 @@ async fn main() -> anyhow::Result<()> {
         let actions = tokio::select! {
             biased;
             _ = &mut sigint => break,
-            Some(msg) = inbound_rx.recv() => collector.on_inbound(msg, Instant::now())?,
+            Some(msg) = inbound_rx.recv() => {
+                max_queue_delay = max_queue_delay.max(Utc::now() - msg.received_at);
+                collector.on_inbound(msg, Instant::now())?
+            }
             Some(found) = symbols_rx.recv() => match found {
                 Discovered::All(live) => {
                     tracing::info!(markets = live.len(), "full discovery");
@@ -96,7 +101,14 @@ async fn main() -> anyhow::Result<()> {
             },
             _ = snapshots.tick() => {
                 let n = collector.write_snapshots(Utc::now())?;
-                tracing::info!(snapshots = n, conns = conns.len(), "periodic snapshot");
+                tracing::info!(
+                    snapshots = n,
+                    conns = conns.len(),
+                    queued = inbound_rx.len(),
+                    max_queue_delay_ms = max_queue_delay.num_milliseconds(),
+                    "periodic snapshot"
+                );
+                max_queue_delay = chrono::TimeDelta::zero();
                 Vec::new()
             }
             _ = tick.tick() => collector.on_tick(Utc::now(), Instant::now())?,
@@ -104,9 +116,8 @@ async fn main() -> anyhow::Result<()> {
         for action in actions {
             match action {
                 Action::Spawn { conn, symbols } => {
-                    debug_assert_eq!(conn, conns.len());
                     let (tx, rx) = mpsc::unbounded_channel();
-                    conns.push(tx);
+                    conns.insert(conn, tx);
                     tasks.spawn(connection::run(
                         exchange.clone(),
                         conn,
@@ -116,14 +127,14 @@ async fn main() -> anyhow::Result<()> {
                     ));
                 }
                 Action::Send { conn, cmd } => {
-                    let _ = conns[conn].send(cmd);
+                    let _ = conns[&conn].send(cmd);
                 }
             }
         }
     }
 
     tracing::info!("SIGINT: closing websockets and flushing output");
-    for tx in &conns {
+    for tx in conns.values() {
         let _ = tx.send(Command::Close);
     }
     if tokio::time::timeout(Duration::from_secs(5), tasks.join_all())
