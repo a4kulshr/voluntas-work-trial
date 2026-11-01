@@ -1,4 +1,4 @@
-//! Kalshi adapter: RSA-PSS request signing, REST market discovery, and the `orderbook_delta` protocol.
+//! Kalshi adapter: Ed25519/RSA-PSS request signing, REST market discovery, and the `orderbook_delta` protocol.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::Signer;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::pss::BlindedSigningKey;
@@ -41,25 +42,52 @@ impl Env {
     }
 }
 
+/// Kalshi accepts Ed25519 (its recommendation) or RSA-PSS/SHA-256 keys.
+enum Key {
+    Ed25519(ed25519_dalek::SigningKey),
+    Rsa(Box<BlindedSigningKey<Sha256>>),
+}
+
+impl Key {
+    fn from_pem(pem: &str) -> anyhow::Result<Self> {
+        if let Ok(k) =
+            <ed25519_dalek::SigningKey as ed25519_dalek::pkcs8::DecodePrivateKey>::from_pkcs8_pem(
+                pem,
+            )
+        {
+            return Ok(Self::Ed25519(k));
+        }
+        let rsa = rsa::RsaPrivateKey::from_pkcs1_pem(pem)
+            .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))
+            .context("Kalshi key must be an Ed25519 or RSA private key in PEM format")?;
+        Ok(Self::Rsa(Box::new(BlindedSigningKey::new(rsa))))
+    }
+
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Ed25519(k) => k.sign(msg).to_bytes().to_vec(),
+            Self::Rsa(k) => k.sign_with_rng(&mut rand::thread_rng(), msg).to_vec(),
+        }
+    }
+}
+
 pub struct Kalshi {
     rest_host: &'static str,
     ws_host: &'static str,
     key_id: String,
-    key: BlindedSigningKey<Sha256>,
+    key: Key,
     http: reqwest::Client,
 }
 
 impl Kalshi {
     pub fn new(env: Env, key_id: String, pem: &str) -> anyhow::Result<Self> {
-        let key = rsa::RsaPrivateKey::from_pkcs1_pem(pem)
-            .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))
-            .context("Kalshi key must be an RSA private key in PEM format")?;
+        let key = Key::from_pem(pem)?;
         let (rest_host, ws_host) = env.hosts();
         Ok(Self {
             rest_host,
             ws_host,
             key_id,
-            key: BlindedSigningKey::new(key),
+            key,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()?,
@@ -69,16 +97,13 @@ impl Kalshi {
     /// Signs `timestamp + method + path` (no query string), per Kalshi's auth spec.
     fn auth_headers(&self, method: &str, path: &str) -> [(&'static str, String); 3] {
         let ts = Utc::now().timestamp_millis().to_string();
-        let sig = self.key.sign_with_rng(
-            &mut rand::thread_rng(),
-            format!("{ts}{method}{path}").as_bytes(),
-        );
+        let sig = self.key.sign(format!("{ts}{method}{path}").as_bytes());
         [
             ("KALSHI-ACCESS-KEY", self.key_id.clone()),
             ("KALSHI-ACCESS-TIMESTAMP", ts),
             (
                 "KALSHI-ACCESS-SIGNATURE",
-                base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+                base64::engine::general_purpose::STANDARD.encode(sig),
             ),
         ]
     }
@@ -141,18 +166,21 @@ impl Exchange for Kalshi {
     async fn list_symbols(
         &self,
         created_since: Option<DateTime<Utc>>,
+        mut on_page: impl FnMut(Vec<String>) + Send,
     ) -> anyhow::Result<BTreeSet<String>> {
         let mut symbols = BTreeSet::new();
         let mut cursor = String::new();
         loop {
             let page = self.markets_page(&cursor, created_since).await?;
             // mve_filter=exclude should already drop these; filter again in case it ever doesn't.
-            symbols.extend(
-                page.markets
-                    .into_iter()
-                    .filter(|m| m.mve_collection_ticker.as_deref().is_none_or(str::is_empty))
-                    .map(|m| m.ticker),
-            );
+            let tickers: Vec<String> = page
+                .markets
+                .into_iter()
+                .filter(|m| m.mve_collection_ticker.as_deref().is_none_or(str::is_empty))
+                .map(|m| m.ticker)
+                .collect();
+            symbols.extend(tickers.iter().cloned());
+            on_page(tickers);
             if page.cursor.is_empty() {
                 return Ok(symbols);
             }

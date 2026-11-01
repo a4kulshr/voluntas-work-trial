@@ -42,9 +42,11 @@ pub trait Exchange: Send + Sync + 'static {
     type Session: Session;
 
     /// Currently tradeable symbols; `created_since` narrows it to recent listings for cheap polling.
+    /// `on_page` sees each page as it arrives, so a slow full listing can start subscriptions early.
     fn list_symbols(
         &self,
         created_since: Option<DateTime<Utc>>,
+        on_page: impl FnMut(Vec<String>) + Send,
     ) -> impl Future<Output = anyhow::Result<BTreeSet<String>>> + Send;
 
     /// A websocket handshake request, including any auth.

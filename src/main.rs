@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut collector = Collector::new(cfg, writer);
 
-    let (symbols_tx, mut symbols_rx) = mpsc::channel(1);
+    let (symbols_tx, mut symbols_rx) = mpsc::unbounded_channel();
     tokio::spawn(discover(
         exchange.clone(),
         symbols_tx,
@@ -149,15 +149,18 @@ enum Discovered {
 const NEW_MARKET_LOOKBACK: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// A cheap frequent poll for new listings, plus a slow full listing that also catches closures.
+/// Each page is subscribed as it arrives; the full set at the end only drives removals.
 async fn discover<E: Exchange>(
     exchange: Arc<E>,
-    out: mpsc::Sender<Discovered>,
+    out: mpsc::UnboundedSender<Discovered>,
     full_every: Duration,
     new_every: Duration,
     max: Option<usize>,
 ) {
     let mut full = tokio::time::interval(full_every);
     let mut new = tokio::time::interval(new_every);
+    // With --max-markets, stick to the first N we ever saw so test runs stay stable.
+    let mut capped: BTreeSet<String> = BTreeSet::new();
     loop {
         let is_full = tokio::select! {
             biased;
@@ -168,24 +171,40 @@ async fn discover<E: Exchange>(
             continue;
         }
         let since = (!is_full).then(|| Utc::now() - NEW_MARKET_LOOKBACK);
-        let found = match exchange.list_symbols(since).await {
-            Ok(symbols) => symbols,
+        let on_page = |page: Vec<String>| {
+            let page: BTreeSet<String> = match max {
+                Some(max) => page
+                    .into_iter()
+                    .filter(|s| {
+                        capped.contains(s) || (capped.len() < max && capped.insert(s.clone()))
+                    })
+                    .collect(),
+                None => page.into_iter().collect(),
+            };
+            if !page.is_empty() {
+                let _ = out.send(Discovered::New(page));
+            }
+        };
+        let found = match exchange.list_symbols(since, on_page).await {
+            Ok(found) => found,
             Err(e) => {
                 tracing::warn!(is_full, "discovery failed: {e:#}");
                 continue;
             }
         };
-        let msg = match is_full {
-            // An empty list is far likelier an API glitch than every market closing at once.
-            true if found.is_empty() => {
-                tracing::warn!("full discovery returned no markets; ignoring");
-                continue;
-            }
-            true => Discovered::All(found.into_iter().take(max.unwrap_or(usize::MAX)).collect()),
-            false if found.is_empty() => continue,
-            false => Discovered::New(found),
+        if !is_full {
+            continue;
+        }
+        // An empty list is far likelier an API glitch than every market closing at once.
+        if found.is_empty() {
+            tracing::warn!("full discovery returned no markets; ignoring");
+            continue;
+        }
+        let live = match max {
+            Some(_) => found.intersection(&capped).cloned().collect(),
+            None => found,
         };
-        if out.send(msg).await.is_err() {
+        if out.send(Discovered::All(live)).is_err() {
             return;
         }
     }
