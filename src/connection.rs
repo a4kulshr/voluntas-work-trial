@@ -139,6 +139,7 @@ async fn stream<E: Exchange>(
                     .ok_or_else(|| anyhow!("stream ended"))??;
                 match frame {
                     Message::Text(text) => {
+                        tracing::trace!(conn = id, frame = text.as_str());
                         for event in session.decode(text.as_str())? {
                             out.send(Inbound { conn: id, received_at, msg: ConnMsg::Event(event) })?;
                         }

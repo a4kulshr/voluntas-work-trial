@@ -361,6 +361,7 @@ impl<S: Sink> Collector<S> {
         now: Instant,
     ) -> anyhow::Result<()> {
         let group = self.conns[conn].group;
+        let mut uncovered = 0;
         for (symbol, market) in self.markets.iter_mut().filter(|(_, m)| m.group == group) {
             let Some(idx) = market.replica(conn) else {
                 continue;
@@ -369,6 +370,14 @@ impl<S: Sink> Collector<S> {
             if market.source == Some(idx) {
                 failover(&mut self.sink, symbol, market, at)?;
             }
+            uncovered += usize::from(market.source.is_none());
+        }
+        if uncovered > 0 {
+            tracing::warn!(
+                conn,
+                uncovered,
+                "markets have no healthy replica until resync"
+            );
         }
         Ok(())
     }
@@ -611,7 +620,7 @@ fn failover(
     match market.source {
         Some(i) => emit_snapshot(sink, symbol, &market.replicas[i], at),
         None => {
-            tracing::warn!(symbol, "no healthy replica; waiting for a snapshot");
+            tracing::debug!(symbol, "no healthy replica; waiting for a snapshot");
             Ok(())
         }
     }

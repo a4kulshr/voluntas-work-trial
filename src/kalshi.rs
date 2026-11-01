@@ -310,13 +310,14 @@ impl Session for KalshiSession {
                     self.sid = Some(msg.sid);
                 }
             }
+            Frame::Ok { seq: Some(seq) } => self.check_seq(seq, &mut events),
             Frame::Error { msg } => {
                 tracing::warn!(code = msg.code, msg = msg.msg, "kalshi error");
                 if msg.code == BUFFER_OVERFLOW {
                     events.push(Event::Gap);
                 }
             }
-            Frame::Other => {}
+            Frame::Ok { seq: None } | Frame::Other => {}
         }
         Ok(events)
     }
@@ -352,6 +353,10 @@ enum Frame {
     },
     Subscribed {
         msg: SubscribedMsg,
+    },
+    /// Acks to commands on an existing sid consume a sequence number (undocumented).
+    Ok {
+        seq: Option<u64>,
     },
     Error {
         msg: ErrorMsg,
@@ -454,6 +459,15 @@ mod tests {
         assert_eq!(s.decode(&delta(3, "yes")).unwrap()[0], Event::Gap);
         let overflow = r#"{"type":"error","msg":{"code":25,"msg":"Subscription buffer overflow"}}"#;
         assert_eq!(s.decode(overflow).unwrap(), [Event::Gap]);
+    }
+
+    #[test]
+    fn command_acks_count_toward_seq() {
+        let mut s = KalshiSession::default();
+        s.decode(SNAPSHOT).unwrap();
+        let ack = r#"{"type":"ok","id":2,"sid":1,"seq":2,"msg":{"market_tickers":["A"]}}"#;
+        assert!(s.decode(ack).unwrap().is_empty());
+        assert_eq!(s.decode(&delta(3, "yes")).unwrap().len(), 1);
     }
 
     #[test]
