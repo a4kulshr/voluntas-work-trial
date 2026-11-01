@@ -135,21 +135,44 @@ after creation, so a 1-hour lookback is ample.
 frames and the real `ok` frame above), and the collector's failover, lag, divergence, reconnect
 staggering and sharding logic.
 
-Live, full scale on demo (all open markets, 190 sockets):
+Live, full scale on demo: a continuous 30-minute run over every open market, 190 sockets, checked
+afterwards with `verify`:
 
-SOAK_RESULTS
+| | |
+|---|---|
+| Markets collected | 232,001 (all open non-MVE markets; full coverage ~11 min after start) |
+| Price-level updates written | 7,160,193 |
+| Snapshots written | 6,062,380 |
+| Snapshots equal to the replayed book | 5,829,362 |
+| Corrections (failover snapshots that differed from the replay) | 1,017 (0.017%) |
+| **Corrections on periodic snapshots** | **0** |
+| Scheduled socket reconnects during the run | 94, all covered by the partner socket |
+| Unplanned disconnects | 0 |
+| Receive time − Kalshi `ts_ms` | p50 77 ms, p99 753 ms, max 2.3 s (laptop clock, home internet) |
 
-"Corrections" are snapshots that differ from the replayed book. Each is the collector replacing a
-lagging or drifted source, so the stream is repaired, but the individual changes during that lag
-are collapsed into one snapshot. Periodic snapshots on a healthy source always match the replay.
+How to read it:
+
+- **Periodic snapshots are the strict check.** They come from the current source's book, so each one
+  must equal an exact replay of every delta written for that market since its previous snapshot.
+  All of them did, so no delta was lost or misapplied on the written stream.
+- **Corrections** are snapshots written on a failover that differ from the replay. Each is the
+  collector replacing a socket whose clock fell behind its partner's (2,419 lag-triggered
+  resubscribes over the run). The book is repaired immediately, but the individual changes during that
+  lag show up as one jump instead of separate updates. "First arrival wins" in LATENCY.md would
+  remove most of them.
+
+`verify` exits non-zero if any periodic snapshot disagrees with the replay.
 
 ## Known limits
 
 - **Crash durability.** `AlignedSbeWriter` buffers a 64 MiB chunk before writing, so a crash
   (not SIGINT) loses up to one chunk. The real fix for process failure is running two collectors,
   which this design supports as-is.
-- **Startup.** A full demo listing takes several minutes, so markets come online page by page.
+- **Startup.** A full demo listing (~230 pages) takes about 10 minutes, so markets come online page by
+  page. Fetching close-time windows in parallel would speed it up, but unauthenticated parallel
+  paging hit HTTP 429 in my tests.
 - **Demo, not prod.** I only had a demo key. Demo's market list and activity are synthetic, which
   matters most for latency (LATENCY.md).
-- **Single collector task.** It kept its queue under ~10 ms at full demo load. Sharding the
-  collector by group would be the next step if it didn't.
+- **Single collector task.** At full demo load its inbound queue peaked around 1.5k messages and
+  ~120 ms of delay (receive timestamps are taken at the socket, so this doesn't skew the data). Prod
+  has fewer markets, but sharding the collector by group is the next step for headroom.
